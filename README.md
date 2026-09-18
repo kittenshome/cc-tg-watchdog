@@ -218,17 +218,6 @@ CTX_PANIC_LIMIT=165000 # 紧急：立刻换气
 
 8. **区分真消息和系统事件。** Telegram 频道里用户消息和系统通知（监控告警之类的）可能使用相似的 `<channel>` 格式。检测漏回消息时要按数字用户 ID 过滤。
 
-## 发布与安全检查
-
-仓库当前脚本只含占位路径和配置项，不含真实 token、私钥、服务器 IP、chat ID 或对话内容。你自己 fork/修改后，发布前至少运行：
-
-```bash
-git grep -nEi 'token|secret|password|api[_-]?key|chat[_-]?id|BEGIN .*PRIVATE KEY'
-git log --all --format='%h %an <%ae> %s'
-```
-
-还要人工检查所有提交历史，因为删除当前文件并不会从 Git 历史中移除曾提交过的密钥。若密钥曾经提交过，应先撤销/轮换密钥，再清理历史。
-
 ## License
 
 MIT
