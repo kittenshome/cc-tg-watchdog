@@ -1,0 +1,6 @@
+.env
+*.log
+*.jsonl
+.credentials.json
+__pycache__/
+watchdog-recovery/

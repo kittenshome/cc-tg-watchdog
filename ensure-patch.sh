@@ -16,20 +16,23 @@
 
 set -u
 
-LOG="${LOG:-/root/tgbot-restart.log}"
-PATCH="${PATCH:-/root/my-telegram.patch}"  # path to your portable patch file
-PATCH_MARKER="MY_CUSTOM_PATCH"             # unique string your patch adds to server.ts
+LOG="${LOG:-$HOME/tgbot-restart.log}"
+PATCH="${PATCH:-$HOME/my-telegram.patch}"  # path to your portable patch file
+PATCH_MARKER="${PATCH_MARKER:-MY_CUSTOM_PATCH}"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # Resolve plugin directory
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
   plugin_dir="$1"
 else
   # Auto-detect from Claude's installed plugins manifest
-  plugin_dir=$(python3 - <<'PY'
+  plugin_dir=$(python3 - "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json" <<'PY'
 import json
-p = '${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json'
+import sys
+p = sys.argv[1]
 try:
-    data = json.load(open(p))
+    with open(p, encoding='utf-8') as f:
+        data = json.load(f)
     items = data.get('plugins', {}).get('telegram@claude-plugins-official', [])
     print(items[-1].get('installPath', '') if items else '')
 except Exception:
@@ -70,11 +73,11 @@ if command -v bun >/dev/null 2>&1; then
   check_dir=$(mktemp -d /tmp/tgbot-patch-build.XXXXXX)
   if ! (cd "$plugin_dir" && bun build ./server.ts --target=bun --outdir="$check_dir" >/dev/null 2>&1); then
     cp -a "$backup" "$server"
-    rm -rf "$check_dir"
+    rm -r "$check_dir"
     echo "$(date '+%F %T') patch build failed, rolled back: $plugin_dir" >> "$LOG"
     exit 1
   fi
-  rm -rf "$check_dir"
+  rm -r "$check_dir"
 fi
 
 echo "$(date '+%F %T') patch restored after plugin update: $plugin_dir backup=$backup" >> "$LOG"
