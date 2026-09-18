@@ -1,204 +1,195 @@
-# Claude Code Telegram Watchdog
+# Claude Code Telegram 看门狗脚本
 
-Keep a Claude Code + Telegram session alive 24/7 on a VPS, with automatic restart, context rotation (auto "breathing"), orphan message recovery, and optional memory injection across restarts.
+让你的 Claude Code + Telegram 在 VPS 上 7×24 跑着不掉线。自动重启、上下文自动换气（省额度不丢记忆）、换气时漏回的消息自动补回、凭证过期自动刷新。
 
-## The Problem
+## 解决什么问题
 
-Running `claude --channels plugin:telegram@claude-plugins-official` on a VPS works great until it doesn't:
+在 VPS 上跑 `claude --channels plugin:telegram@claude-plugins-official`，迟早会遇到：
 
-- The tmux session dies silently
-- Claude hits a rate limit dialog and gets stuck
-- The Telegram Bun process loses its TCP connection
-- API credentials expire mid-session (401 loops)
-- The context window fills up and Claude starts forgetting things
-- A restart happens right when a message arrives, and nobody replies
+- tmux 进程悄悄死掉
+- 撞上额度弹窗卡住不动
+- Telegram 的 Bun 进程断连
+- API 凭证过期，401 死循环
+- 上下文窗口越来越大，每句话烧一大把 token
+- 换气/重启那一刻刚好来了消息，没人回
 
-This repo solves all of them.
+这套脚本全解决。
 
-## Architecture
+## 架构
 
 ```
-crontab (every 3 min)
+crontab（每3分钟）
   |
   v
-tgbot-watchdog.sh ── checks health ── all good? exit
-  |                                       |
-  | (something wrong)                     |
-  v                                       |
-tgbot.sh ── kills old session             |
-  |      ── recovers orphan messages      |
-  |      ── refreshes credentials         |
-  |      ── launches new tmux session     |
-  |      ── verifies Telegram connection  |
-  v                                       |
-claude --channels plugin:telegram  <------+
-  (running in tmux session "tgbot")
+tgbot-watchdog.sh ── 检查健康 ── 正常？跳过
+  |                                  |
+  |（出问题了）                       |
+  v                                  |
+tgbot.sh ── 杀旧进程                 |
+  |      ── 补回漏掉的消息            |
+  |      ── 刷新凭证                  |
+  |      ── 启动新 tmux 会话          |
+  |      ── 验证 Telegram 连接        |
+  v                                  |
+claude --channels plugin:telegram  <-+
+  （跑在 tmux "tgbot" 里）
 ```
 
-## Quick Start
+## 快速开始
 
-### Prerequisites
+### 前置条件
 
-- A VPS with Claude Code CLI installed and authenticated
-- The Telegram plugin (`plugin:telegram@claude-plugins-official`)
-- `tmux` installed
-- A working Telegram bot token configured in the plugin
+- 一台 VPS，装好 Claude Code CLI 并登录
+- Telegram 插件（`plugin:telegram@claude-plugins-official`）
+- `tmux`
+- 配好 Telegram bot token
 
-### 1. Copy the scripts
+### 1. 复制脚本
 
 ```bash
-# Put these in your home directory (or wherever you like)
 cp watchdog.sh ~/tgbot-watchdog.sh
 cp start.sh ~/tgbot.sh
 cp orphan-recovery.py ~/tgbot-orphan.py
 chmod +x ~/tgbot-watchdog.sh ~/tgbot.sh
 ```
 
-### 2. Configure
+### 2. 配置
 
-Edit `tgbot.sh` and set:
+编辑 `tgbot.sh`，设置：
 
 ```bash
-# Your Claude config directory (where .credentials.json lives)
+# Claude 配置目录（.credentials.json 所在位置）
 CLAUDE_CONFIG_DIR="/root/.claude"
 
-# tmux session name
+# tmux 会话名
 SESSION_NAME="tgbot"
 
-# Model to use
+# 使用的模型
 MODEL="claude-sonnet-4-6"
 ```
 
-### 3. Set up crontab
+### 3. 设置定时任务
 
 ```bash
 crontab -e
-# Add this line:
+# 加这行：
 */3 * * * * /root/tgbot-watchdog.sh
 ```
 
-That's it. The watchdog runs every 3 minutes, checks health, and restarts if needed.
+完事。看门狗每 3 分钟跑一次，检查健康状态，有问题自动重启。
 
-## What the Watchdog Checks
+## 看门狗检查什么
 
-The watchdog runs a series of health checks, in order:
+按顺序跑以下检查：
 
-| # | Check | What it catches | Action |
-|---|-------|----------------|--------|
-| 1 | tmux session exists | Process crash, OOM kill, server reboot | Full restart |
-| 2 | Screen content: `could not be parsed` | Unrecoverable channel parse failure | Full restart |
-| 3 | Screen content: `Upgrade your plan` | Rate limit dialog blocking input | Send Escape key |
-| 4 | Screen content: `Select login method` | Accidentally entered login flow | Send Escape, restart if stuck |
-| 5 | Context token count | Context window filling up | Restart when idle (see below) |
-| 6 | Screen content: `API Error: 401` (x2) | Expired credentials | Full restart |
-| 7 | Orphaned Bun processes | Zombie Telegram processes | Kill orphans |
-| 8 | Bun TCP connection | Silent Telegram disconnection | Restart after 2 consecutive fails |
+| # | 检查项 | 抓什么问题 | 处理方式 |
+|---|--------|-----------|---------|
+| 1 | tmux 会话是否存在 | 进程崩溃、OOM、服务器重启 | 完整重启 |
+| 2 | 屏幕内容：`could not be parsed` | 频道解析错误，无法恢复 | 完整重启 |
+| 3 | 屏幕内容：`Upgrade your plan` | 额度弹窗卡住了 | 发 Escape 键 |
+| 4 | 屏幕内容：`Select login method` | 不小心进了登录流程 | 发 Escape，卡住就重启 |
+| 5 | 上下文 token 数 | 上下文窗口快满了 | 等空闲时重启（见下文） |
+| 6 | 屏幕内容：`API Error: 401`（×2） | 凭证过期 | 完整重启 |
+| 7 | 孤儿 Bun 进程 | Telegram 僵尸进程 | 杀掉孤儿进程 |
+| 8 | Bun TCP 连接 | Telegram 静默断连 | 连续失败2次后重启 |
 
-## Context Rotation ("Breathing")
+## 上下文换气
 
-The watchdog automatically rotates the Claude session when the context window gets too large. This prevents Claude's built-in context compression from kicking in, which causes worse "memory loss" than a clean restart.
+看门狗在上下文窗口太大时自动换气（重启会话）。这么做是因为让 Claude 自带的上下文压缩介入会丢更多东西，不如干净地换一次气。
 
-Three thresholds:
+三档阈值：
 
-| Threshold | Tokens | Idle requirement | Rationale |
-|-----------|--------|-----------------|-----------|
-| Soft | 120,000 | 15 min idle | Normal rotation. Waits for a quiet moment. |
-| Hard | 155,000 | 2 min idle | Approaching compression zone. Brief idle check to avoid killing an in-flight reply. |
-| Panic | 165,000 | None | About to hit compression. Restart immediately. |
+| 档位 | Token 数 | 空闲要求 | 为什么 |
+|------|---------|---------|-------|
+| 软限制 | 120,000 | 空闲15分钟 | 正常换气，等个安静的时机 |
+| 硬限制 | 155,000 | 空闲2分钟 | 快到压缩区了，简单确认没在回消息就换 |
+| 紧急 | 165,000 | 无 | 马上要压缩了，立刻换 |
 
-**How it measures tokens:** Reads the session JSONL file and extracts `cache_creation_input_tokens + cache_read_input_tokens` from the last non-zero usage entry. This is the actual context window size, not an estimate.
+**怎么测 token 数：** 读会话的 JSONL 文件，取最后一条非零 usage 里的 `cache_creation_input_tokens + cache_read_input_tokens`，这是实际上下文窗口大小。
 
-**How it knows Claude is idle:** Checks two things:
-1. The tmux screen does NOT contain "esc to interrupt" (Claude is not mid-response)
-2. The JSONL file's mtime is old enough (Claude hasn't processed anything recently)
+**怎么判断空闲：** 看两个条件：
+1. tmux 屏幕上没有 "esc to interrupt"（Claude 没在回消息）
+2. JSONL 文件的修改时间够老（最近没处理过东西）
 
-## Orphan Message Recovery
+## 漏回消息自动补回
 
-The most painful failure mode: a restart happens right when someone sends a message. The old session dies before replying, and the new session has no idea the message exists.
+最痛的故障：换气/重启那一刻刚好来了消息，旧会话死了没回，新会话又不知道有这条消息。
 
-The orphan recovery system fixes this:
+补回机制：
 
-1. **Before killing the old session**, `tgbot.sh` reads its JSONL transcript
-2. `tgbot-orphan.py` finds the last inbound message and checks if any `assistant` turn after it contains a `telegram__reply` tool call
-3. If the last message was never replied to, it's an "orphan"
-4. After the new session starts, the startup script injects a prompt telling Claude to reply to that orphan message, with a few turns of preceding context for continuity
+1. 杀旧会话之前，读它的 JSONL 记录
+2. `tgbot-orphan.py` 找到最后一条用户消息，检查后面有没有 `telegram__reply` 工具调用
+3. 如果最后一条消息没被回过，就是"漏网之鱼"
+4. 新会话启动后，自动注入一条提示让 Claude 回复这条漏掉的消息，附带前面几轮对话作为上下文
 
-```python
-# The key logic in orphan-recovery.py:
-# 1. Find the last inbound Telegram message from the user
-# 2. Check if any assistant turn after it called telegram__reply
-# 3. If not: it's an orphan. Return the text for the startup script.
-```
+## 记忆注入（进阶功能）
 
-## Memory Injection (Optional Advanced Feature)
+如果你想让 Claude 在换气后还能记住之前聊的内容，可以搭一个记忆网关：
 
-For users who want Claude to retain context across restarts, you can build a memory gateway that:
+1. 把所有 Telegram 收发的消息存到数据库
+2. 每条新消息进来时，取出相关记忆和最近对话历史
+3. 作为前缀注入到用户消息前面，Claude 看到的时候就带着上下文了
 
-1. Records all inbound/outbound Telegram messages to a database
-2. On each new message, retrieves relevant memories and recent conversation history
-3. Injects this context as a preamble to the user's message before Claude sees it
+这需要给 Telegram 插件的 `server.ts` 打补丁。
 
-This requires patching the Telegram plugin's `server.ts`. See [Memory Gateway](docs/memory-gateway.md) for details.
+`ensure-patch.sh` 脚本会在插件自动更新后重新打补丁，打失败自动回滚：
 
-The `ensure-patch.sh` script automatically re-applies this patch when the plugin auto-updates, with rollback on failure:
+1. 检查 `server.ts` 是否已经有补丁标记
+2. 没有的话尝试应用 `.patch` 文件
+3. 构建验证能不能编译
+4. 编译失败就回滚到备份
 
-1. Check if `server.ts` already has the patch markers
-2. If not, try applying the portable `.patch` file
-3. Build the result to verify it compiles
-4. If the build fails, roll back to the backup
+## 文件说明
 
-## Files
+| 文件 | 用途 |
+|------|------|
+| `watchdog.sh` | 健康检查器，crontab 每3分钟跑 |
+| `start.sh` | 完整启动流程，含漏回消息补回 |
+| `orphan-recovery.py` | 检测会话记录里没被回复的消息 |
+| `ensure-patch.sh` | 插件更新后自动重新打记忆网关补丁 |
 
-| File | Purpose |
-|------|---------|
-| `watchdog.sh` | Health checker, runs from crontab every 3 min |
-| `start.sh` | Full startup procedure with orphan recovery |
-| `orphan-recovery.py` | Detects unreplied messages in session transcripts |
-| `ensure-patch.sh` | Maintains memory gateway patch across plugin updates |
+## 配置项
 
-## Configuration
+### 环境变量
 
-### Environment Variables
+| 变量 | 默认值 | 说明 |
+|------|-------|------|
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code 配置目录 |
+| `CLAUDE_CODE_OAUTH_TOKEN` | （无） | 覆盖认证 token |
+| `SESSION_NAME` | `tgbot` | tmux 会话名 |
+| `MODEL` | `claude-sonnet-4-6` | 使用的 Claude 模型 |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
-| `CLAUDE_CODE_OAUTH_TOKEN` | (none) | Override authentication token |
-| `SESSION_NAME` | `tgbot` | tmux session name |
-| `MODEL` | `claude-sonnet-4-6` | Claude model to use |
-| `GIN_SKIP_INITIAL_RECENT_CONTEXT` | `0` | Skip initial memory injection |
+### 调整换气阈值
 
-### Tuning Context Rotation
-
-Edit the thresholds in `watchdog.sh`:
+编辑 `watchdog.sh` 里的阈值：
 
 ```bash
-CTX_LIMIT=120000      # Soft limit: rotate when idle for 15 min
-CTX_HARD_LIMIT=155000 # Hard limit: rotate when idle for 2 min
-CTX_PANIC_LIMIT=165000 # Panic: rotate immediately
+CTX_LIMIT=120000      # 软限制：空闲15分钟后换气
+CTX_HARD_LIMIT=155000 # 硬限制：空闲2分钟后换气
+CTX_PANIC_LIMIT=165000 # 紧急：立刻换气
 ```
 
-Lower these if you want more frequent rotation (shorter conversations, less context usage). Raise them if you want longer conversations before rotation.
+想换气更频繁就调低，想聊更久再换就调高。
 
-## Lessons Learned
+## 踩过的坑
 
-These are real failure modes discovered in production over months of 24/7 operation:
+在 7×24 实际跑了几个月踩出来的：
 
-1. **Don't use arrow keys in rate limit dialogs.** The "Upgrade your plan / Stop and wait" dialog ignores arrow keys. Pressing Enter selects "Upgrade" and puts Claude into a `/upgrade` login flow it can't escape. Use Escape instead.
+1. **额度弹窗不能按方向键。** "Upgrade your plan / Stop and wait" 弹窗不理方向键，按回车会选中 "Upgrade" 然后进入 `/upgrade` 登录流程，出不来。要按 Escape。
 
-2. **Context rotation must check idle state.** An early version rotated mid-conversation. The user's first message to the new session hit a Claude with zero context. Now rotation waits for idle.
+2. **换气必须等空闲。** 早期版本在聊天中途换气，用户第一条消息打到一个零上下文的 Claude 上。现在换气前先确认空闲。
 
-3. **Hard rotation limits need idle checks too.** Even the hard limit (155k tokens) needs at least 2 minutes of idle. A message arrived 4 seconds before a forced rotation and was swallowed with no reply.
+3. **硬限制也得等空闲。** 就算到了 155k token 的硬限制，至少也等 2 分钟空闲。有一次消息到达 4 秒后就被强制换气，那条消息被吞了没回。
 
-4. **Bun zombies need parent-PID checks.** Simply killing all `bun server.ts` processes can kill the active one. Only kill orphans whose parent PID is 1 (init-adopted).
+4. **杀 Bun 僵尸要查父进程 PID。** 不能直接杀所有 `bun server.ts` 进程，会把正在用的那个也杀了。只杀父进程 PID 是 1（被 init 接管）的孤儿进程。
 
-5. **TCP connection checks need two consecutive failures.** A single check without a Telegram TCP connection can be a momentary network blip. Require two consecutive failures before restarting.
+5. **TCP 检查要连续失败两次。** 一次 Telegram TCP 连接检查失败可能只是网络抖了一下。连续两次失败才重启。
 
-6. **401 errors need a count threshold.** A single 401 can be transient. Two or more means the credentials are actually expired.
+6. **401 错误要累计。** 一次 401 可能是暂时的，两次以上才说明凭证真的过期了。
 
-7. **Credential refresh before restart.** Run a minimal Claude call (haiku, "ok") before starting the real session to force credential refresh. Without this, a 401 loop can repeat 21 times without recovery.
+7. **重启前先刷新凭证。** 启动真正的会话之前，先跑一次最小的 Claude 调用（haiku，"ok"）强制刷新凭证。不这么做的话，401 死循环能连续重复 21 次。
 
-8. **Orphan detection must distinguish real messages from system events.** The Telegram channel delivers both user messages and system notifications (watcher alerts, free-speak opportunities) in the same `<channel>` format. Orphan detection must filter by user ID (real users have numeric IDs).
+8. **区分真消息和系统事件。** Telegram 频道里用户消息和系统通知（监控告警之类的）用的是同一个 `<channel>` 格式。检测漏回消息时要按用户 ID 过滤（真人用户的 ID 是数字）。
 
 ## License
 
